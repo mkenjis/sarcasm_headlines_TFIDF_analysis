@@ -1,0 +1,202 @@
+
+val df = spark.read.format("json").load("sarcasm_hdline/Sarcasm_Headlines_Dataset.json")
+
+scala> df.printSchema
+root
+ |-- article_link: string (nullable = true)
+ |-- headline: string (nullable = true)
+ |-- is_sarcastic: long (nullable = true)
+ 
+scala> df.show
++--------------------+--------------------+------------+
+|        article_link|            headline|is_sarcastic|
++--------------------+--------------------+------------+
+|https://www.huffi...|former versace st...|           0|
+|https://www.huffi...|the 'roseanne' re...|           0|
+|https://local.the...|mom starting to f...|           1|
+|https://politics....|boehner just want...|           1|
+|https://www.huffi...|j.k. rowling wish...|           0|
+|https://www.huffi...|advancing the wor...|           0|
+|https://www.huffi...|the fascinating c...|           0|
+|https://www.huffi...|this ceo will sen...|           0|
+|https://politics....|top snake handler...|           1|
+|https://www.huffi...|friday's morning ...|           0|
+|https://www.huffi...|airline passenger...|           0|
+|https://www.huffi...|facebook reported...|           0|
+|https://www.huffi...|north korea prais...|           0|
+|https://www.huffi...|actually, cnn's j...|           0|
+|https://www.huffi...|barcelona holds h...|           0|
+|https://entertain...|nuclear bomb deto...|           1|
+|https://www.theon...|cosby lawyer asks...|           1|
+|https://www.theon...|stock analysts co...|           1|
+|https://www.huffi...|bloomberg's progr...|           0|
+|https://www.huffi...|craig hicks indicted|           0|
++--------------------+--------------------+------------+
+
+val rdd1 = df.select("headline","is_sarcastic").rdd.map( x => x.toSeq.toArray )
+
+val rdd = rdd1.map( x => x.map( y => y.toString ))
+
+-- remove nonword characters (such as punctuation).
+val nonWordSplit = rdd.flatMap(x => x(0).split("""\W+""").map(_.toLowerCase))
+nonWordSplit.sample(true, 0.3, 42).take(100).mkString(",")
+nonWordSplit.distinct.count   // 25320
+
+-- filter out numbers and tokens that are words mixed with numbers
+val regex = """[^0-9]*""".r
+val filterNumbers = nonWordSplit.filter(token => regex.pattern.matcher(token).matches)
+filterNumbers.sample(false, 0.3, 42).take(100).mkString("\n")
+filterNumbers.distinct.count   // 24882
+
+-- list highest occurrence of words to get an idea which stop words to be removed
+val tokenCounts = filterNumbers.map(t => (t, 1)).reduceByKey(_ + _)
+val orderingDesc = Ordering.by[(String, Int), Int](_._2)
+tokenCounts.top(20)(orderingDesc).mkString("\n")
+
+-- remove stop words
+val stopwords = Set(
+ "the","a","an","of","or","in","for","by","on","but", "is", "not", "with", "as", "was", "if",
+ "they", "are", "this", "and", "it", "have", "from", "at", "my", "be", "that", "to", "so", "what"
+)
+val tokenCountsFilteredStopwords = tokenCounts.filter { case(k, v) => !stopwords.contains(k) }
+tokenCountsFilteredStopwords.top(20)(orderingDesc).mkString("\n")
+
+-- lists tokens greather one-character length
+val tokenCountsFilteredSize = tokenCountsFilteredStopwords.filter { case (k, v) => k.size >= 2 }
+tokenCountsFilteredSize.top(20)(orderingDesc).mkString("\n")
+
+-- list least occurring terms in the corpus
+val orderingAsc = Ordering.by[(String, Int), Int](-_._2)
+tokenCountsFilteredSize.top(20)(orderingAsc).mkString("\n")
+
+-- remove terms with only one-occurrence
+val rareTokens = tokenCounts.filter{ case (k, v) => v < 2 }.map{ case (k, v) => k }.collect.toSet
+val tokenCountsFilteredAll = tokenCountsFilteredSize.filter { case (k, v) => !rareTokens.contains(k) }
+tokenCountsFilteredAll.top(20)(orderingAsc).mkString("\n")
+
+tokenCountsFilteredAll.count
+res24: Long = 13938
+
+def tokenize(line: String): Seq[String] = {
+ line.split("""\W+""")
+ .map(_.toLowerCase)
+ .filter(token => regex.pattern.matcher(token).matches)
+ .filterNot(token => stopwords.contains(token))
+ .filterNot(token => rareTokens.contains(token))
+ .filter(token => token.size >= 2)
+ .toSeq
+}
+
+rdd.flatMap(x => tokenize(x(0))).distinct.count
+res27: Long = 13938
+
+val sets = rdd.randomSplit(Array(0.7,0.3))
+val trainSet = sets(0)
+val testSet = sets(1)
+
+val tokens = trainSet.map(x => tokenize(x(0)))
+tokens.first.take(20)
+
+---------------------------
+
+import org.apache.spark.mllib.linalg.{ SparseVector => SV }
+import org.apache.spark.mllib.feature.HashingTF
+import org.apache.spark.mllib.feature.IDF
+
+val dim = math.pow(2, 15).toInt
+val hashingTF = new HashingTF(dim)
+
+-- transform function of HashingTF maps each input document (that is, a sequence of tokens) to an MLlib Vector.
+val tf = hashingTF.transform(tokens)
+tf.cache
+
+val v = tf.first.asInstanceOf[SV]
+v.size
+v.values.size
+println(v.values.take(10).toSeq)
+println(v.indices.take(10).toSeq)
+
+-- compute the inverse document frequency for each term in the corpus
+-- by creating a new IDF instance and calling fit with our RDD of term frequency
+-- vectors as the input. We will then transform our term frequency vectors to TF-IDF
+-- vectors through the transform function of IDF:
+
+val idf = new IDF().fit(tf)
+val tfidf = idf.transform(tf)
+val v2 = tfidf.first.asInstanceOf[SV]
+println(v2.values.size)
+println(v2.values.take(10).toSeq)
+println(v2.indices.take(10).toSeq)
+
+---------------------
+
+import org.apache.spark.mllib.regression.LabeledPoint
+
+val zippedTrain = trainSet.zip(tfidf)
+val train = zippedTrain.map{ case(text,vector) => LabeledPoint(text(1).toDouble,vector) }
+train.cache
+
+val testTf = testSet.map(x => hashingTF.transform(tokenize(x(0))))
+val testTfIdf = idf.transform(testTf)
+
+val zippedTest = testSet.zip(testTfIdf)
+val test = zippedTest.map{ case(text,vector) => LabeledPoint(text(1).toDouble,vector) }
+test.cache
+
+---- MLlib logistic regression --------------
+
+import org.apache.spark.mllib.classification.LogisticRegressionWithSGD
+val numIterations = 100
+val model = LogisticRegressionWithSGD.train(train, numIterations)
+
+val validPredicts =  test.map(p => (model.predict(p.features),p.label))
+
+validPredicts.take(20)
+res66: Array[(Double, Double)] = Array((0.0,1.0), (1.0,0.0), (0.0,0.0), (1.0,0.0), (0.0,0.0), (1.0,1.0), (1.0,0.0), (0.0,0.0), (1.0,0.0), (0.0,0.0), (0.0,1.0), (0.0,1.0), (1.0,1.0), (0.0,0.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (0.0,1.0), (0.0,0.0))
+
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+val metrics = new BinaryClassificationMetrics(validPredicts)
+validPredicts.filter(x => x._1 == x._2).count  // 6392
+validPredicts.count                            // 8080
+model.getClass.getSimpleName
+metrics.areaUnderPR   //  0.725544491556522
+metrics.areaUnderROC  //  0.7846807847781418
+
+---- MLlib SVM regression --------------
+
+import org.apache.spark.mllib.classification.SVMWithSGD
+val numIterations = 100
+val model = SVMWithSGD.train(train, numIterations)
+
+val validPredicts = test.map(p => (model.predict(p.features),p.label))
+
+validPredicts.take(20)
+res78: Array[(Double, Double)] = Array((0.0,1.0), (1.0,0.0), (0.0,0.0), (1.0,0.0), (0.0,0.0), (1.0,1.0), (1.0,0.0), (0.0,0.0), (1.0,0.0), (0.0,0.0), (0.0,1.0), (0.0,1.0), (1.0,1.0), (0.0,0.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (0.0,1.0), (0.0,1.0), (0.0,0.0))
+
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+val metrics = new BinaryClassificationMetrics(validPredicts)
+validPredicts.filter(x => x._1 == x._2).count  // 6442
+validPredicts.count                            // 8080
+model.getClass.getSimpleName
+metrics.areaUnderPR   //  0.7326049647445733
+metrics.areaUnderROC  //  0.7912225580903629
+
+---- MLlib Naive Bayes regression --------------
+
+import org.apache.spark.mllib.classification.NaiveBayes
+val model = NaiveBayes.train(train)
+
+val validPredicts =  test.map(p => (model.predict(p.features),p.label))
+
+validPredicts.take(20)
+res84: Array[(Double, Double)] = Array((1.0,1.0), (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0), (1.0,1.0), (0.0,0.0), (0.0,0.0), (1.0,0.0), (0.0,0.0), (0.0,1.0), (1.0,1.0), (1.0,1.0), (0.0,0.0), (1.0,1.0), (1.0,1.0), (0.0,1.0), (0.0,1.0), (0.0,1.0), (0.0,0.0))
+
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+val metrics = new BinaryClassificationMetrics(validPredicts)
+validPredicts.filter(x => x._1 == x._2).count  // 6268
+validPredicts.count                            // 8080
+model.getClass.getSimpleName
+metrics.areaUnderPR   //  0.6967757009592834
+metrics.areaUnderROC  //  0.7734103269925566
+
+
