@@ -1,3 +1,4 @@
+---- Feature extraction & Data Munging --------------
 
 val df = spark.read.format("json").load("sarcasm_hdline/Sarcasm_Headlines_Dataset.json")
 
@@ -198,5 +199,3 @@ validPredicts.count                            // 8080
 model.getClass.getSimpleName
 metrics.areaUnderPR   //  0.6967757009592834
 metrics.areaUnderROC  //  0.7734103269925566
-
-
